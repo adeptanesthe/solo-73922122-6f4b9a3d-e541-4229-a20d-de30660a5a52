@@ -8,6 +8,7 @@ import pytest
 from app.audio import (
     AudioValidationError,
     detect_impacts,
+    find_weak_peaks,
     parse_wav,
     validate_reference,
 )
@@ -47,6 +48,54 @@ def test_second_impulse_at_50ms_is_detected():
     times = [0.5, 0.55, 1.0, 1.5, 2.0]
     det = detect_impacts(parse_wav(build_wav(times, duration=2.5)))
     assert len(det.times) == 5
+
+
+def test_masked_weak_impact_found_by_weak_scan():
+    """重击抬高自适应门限时，检测漏掉的轻冲应能被弱峰补查找回。"""
+    times = [0.5, 1.0, 1.5, 2.0]
+    wav = build_wav(times, duration=2.6, gains={1.5: 0.08})
+    samples = parse_wav(wav)
+    det = detect_impacts(samples)
+    assert not any(t == pytest.approx(1.5, abs=0.03) for t in det.times)  # 常规检测漏掉轻冲
+    assert len(det.times) == 3
+
+    weak = find_weak_peaks(
+        samples, 0.0, det.duration,
+        exclude_times=list(det.times) + list(det.suppressed_echoes),
+    )
+    assert any(t == pytest.approx(1.5, abs=0.02) for t in weak)
+
+
+def test_weak_scan_excludes_confirmed_echoes():
+    """弱峰补查沿用 40ms 去回声：已确认冲次与其回声都不再作为弱峰。"""
+    times = [0.5, 1.0, 1.5, 2.0]
+    wav = build_wav(
+        times, duration=2.6,
+        echoes={1.5: 0.035}, echo_gain=0.5,
+    )
+    samples = parse_wav(wav)
+    det = detect_impacts(samples)
+    assert len(det.suppressed_echoes) == 1
+    weak = find_weak_peaks(
+        samples, 0.0, det.duration,
+        exclude_times=list(det.times) + list(det.suppressed_echoes),
+    )
+    assert weak == []
+
+
+def test_weak_scan_ignores_background_ripple():
+    """没有重击遮蔽时，普通背景起伏不应被当成弱峰。"""
+    times = [0.5, 1.0, 1.5, 2.0]
+    samples = parse_wav(
+        build_wav(times, duration=2.6, gain=0.4, noise_floor=0.02)
+    )
+    det = detect_impacts(samples)
+    assert len(det.times) == 4
+    weak = find_weak_peaks(
+        samples, 0.0, det.duration,
+        exclude_times=list(det.times) + list(det.suppressed_echoes),
+    )
+    assert weak == []
 
 
 def test_validate_reference_bounds():

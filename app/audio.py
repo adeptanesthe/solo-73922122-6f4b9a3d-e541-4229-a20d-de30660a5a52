@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import wave
 from dataclasses import dataclass
+from typing import Iterable
 
 import numpy as np
 
@@ -25,6 +26,9 @@ MIN_IMPACT_INTERVAL_SEC = 0.040   # 40 ms 内回声不算多冲
 ABS_RATIO = 0.15        # 相对全段最大能量的最低能量门限
 PROMINENCE_RATIO = 2.0  # 相对局部背景能量的突出倍数
 BACKGROUND_SEC = 0.030  # 局部背景统计窗口
+# 弱峰补查：不跟随全段峰值，只要求明显高于附近背景（重击遮蔽轻冲时使用）
+WEAK_PROMINENCE_RATIO = 3.0
+WEAK_BACKGROUND_SEC = 0.030
 REF_MIN_IMPACTS = 4
 REF_MAX_IMPACTS = 8
 REF_MIN_GAP_SEC = 0.150
@@ -164,6 +168,66 @@ def detect_impacts(samples: np.ndarray) -> ImpactDetection:
         duration=len(samples) / SAMPLE_RATE,
         peak_energy=peak_energy,
     )
+
+
+def find_weak_peaks(
+    samples: np.ndarray,
+    start_sec: float,
+    end_sec: float,
+    exclude_times: Iterable[float] = (),
+) -> list[float]:
+    """在 (start_sec, end_sec) 内查找明显高于附近背景的弱峰。
+
+    与 ``detect_impacts`` 不同，这里不使用跟随全段峰值的绝对门限：
+    一声重击会抬高全段峰值，使相邻轻冲低于门限而漏检；补查只看局部背景，
+    因此能找出被重击遮蔽的弱冲。同样执行 40 ms 去回声：
+
+    - 与 ``exclude_times``（已确认冲次及其被抑制的回声）相距不足 40 ms 的峰剔除；
+    - 弱峰彼此之间也按 40 ms 窗口只保留最强的一个。
+    """
+    centers, energies = _energy_envelope(samples)
+    if len(energies) == 0:
+        return []
+
+    lo = int(np.searchsorted(centers, start_sec, side="right"))
+    hi = int(np.searchsorted(centers, end_sec, side="left"))
+    if hi <= lo:
+        return []
+
+    bg_frames = max(1, int(round(WEAK_BACKGROUND_SEC / HOP_SEC)))
+    local_win = max(1, int(round(0.010 / HOP_SEC)))  # ±10ms
+    peak_frames: list[int] = []
+    for i in range(lo, hi):
+        bg_lo = max(0, i - bg_frames)
+        bg_hi = min(len(energies), i + bg_frames + 1)
+        local_bg = float(np.median(energies[bg_lo:bg_hi]))
+        e = float(energies[i])
+        if e < WEAK_PROMINENCE_RATIO * max(local_bg, 1e-12):
+            continue
+        win_lo = max(0, i - local_win)
+        win_hi = min(len(energies), i + local_win + 1)
+        if i != win_lo + int(np.argmax(energies[win_lo:win_hi])):
+            continue
+        peak_frames.append(i)
+
+    # 弱峰之间的 40ms 去回声：窗口内只留能量最大者
+    min_interval_frames = max(1, int(round(MIN_IMPACT_INTERVAL_SEC / HOP_SEC)))
+    kept_idx: list[int] = []
+    for i in peak_frames:
+        if kept_idx and i - kept_idx[-1] < min_interval_frames:
+            if energies[i] > energies[kept_idx[-1]]:
+                kept_idx[-1] = i
+            continue
+        kept_idx.append(i)
+
+    excluded = np.asarray(sorted(exclude_times), dtype=float)
+    weak_times: list[float] = []
+    for i in kept_idx:
+        t = float(centers[i])
+        if excluded.size and float(np.min(np.abs(excluded - t))) < MIN_IMPACT_INTERVAL_SEC:
+            continue
+        weak_times.append(t)
+    return weak_times
 
 
 def validate_reference(det: ImpactDetection) -> None:

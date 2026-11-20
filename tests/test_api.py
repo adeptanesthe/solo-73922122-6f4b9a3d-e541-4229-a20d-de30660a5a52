@@ -127,3 +127,57 @@ def test_index_page(client):
     resp = client.get("/")
     assert resp.status_code == 200
     assert "冲压机" in resp.text
+
+
+def test_masked_weak_impact_recovered_as_matched(client):
+    """重击遮蔽轻冲：常规检测漏掉，补查后按匹配处理，不再报漏冲。"""
+    test = build_wav(
+        REF_TIMES, duration=2.6, noise_floor=0.002, gains={1.5: 0.06}
+    )
+    body = post_inspect(client, _ref(), test).json()
+    assert body["summary"]["detected_impact_count"] == 3
+    assert body["summary"]["recovered_count"] == 1
+    assert body["verdict"] == "ok"
+    assert body["summary"]["miss_count"] == 0
+    assert body["missed"] == []
+    rec = body["recovered"][0]
+    assert rec["ref_index"] == 2
+    assert rec["time"] == pytest.approx(1.5, abs=0.02)
+    # 补回冲次进入待检冲次序列并标记为已匹配
+    recovered_imp = [i for i in body["test"]["impacts"] if i["is_recovered"]]
+    assert len(recovered_imp) == 1
+    assert recovered_imp[0]["matched"] is True
+    assert any("补回" in w for w in body["warnings"])
+
+
+def test_masked_weak_impact_echo_not_counted_as_extra(client):
+    """轻冲被重击遮蔽且带 35ms 回声：补回轻冲，回声仍不计多冲。"""
+    test = build_wav(
+        REF_TIMES, duration=2.6,
+        gains={1.5: 0.06}, extra_echoes=[(1.5, 0.035, 0.08)],
+    )
+    body = post_inspect(client, _ref(), test).json()
+    assert body["summary"]["recovered_count"] == 1
+    assert body["summary"]["extra_count"] == 0
+    assert body["verdict"] == "ok"
+
+
+def test_recovery_tie_keeps_original_verdict_and_asks_review(client):
+    """补回归属并列：该段保留原判定（漏冲仍在），并提示人工复听。"""
+    # 重击 0.5/1.5/2.0 遮蔽了两个轻冲 0.95/1.05：二者都只能算 ±15% 内的
+    # 同一参考冲次，补回数并列且归属不同
+    test = build_wav(
+        [0.5, 0.95, 1.05, 1.5, 2.0],
+        duration=2.4,
+        gains={0.95: 0.06, 1.05: 0.06},
+    )
+    body = post_inspect(client, _ref(), test).json()
+    assert body["summary"]["recovered_count"] == 0
+    assert body["summary"]["miss_count"] == 1
+    assert body["summary"]["extra_count"] == 0  # 未采用的弱峰不计多冲
+    assert body["review_required"] is True
+    assert len(body["review_segments"]) == 1
+    seg = body["review_segments"][0]
+    assert seg["start"] == pytest.approx(0.5, abs=0.02)
+    assert seg["end"] == pytest.approx(1.5, abs=0.02)
+    assert any("人工复听" in w for w in body["warnings"])

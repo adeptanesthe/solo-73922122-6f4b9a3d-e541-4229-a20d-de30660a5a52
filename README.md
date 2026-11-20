@@ -14,8 +14,15 @@
 2. **回声处理**：同一冲击 40 ms 不应期内的峰（含衰减拖尾、回声）只保留最强一个，回声不计多冲。
 3. **节奏匹配（动态规划）**：以参考冲次序号为基准做最优对齐，成本 = 漏冲数 + 多冲数；相邻匹配的累计时长须落在参考节奏 ±15% 窗口内。
 4. **漏冲不错位**：漏冲只计一次成本，后续冲次仍按参考序号继续对齐，不会整体错位。
-5. **歧义人工复听**：若多种归属具有相同的最优成本（同样满足节奏与最少漏/多冲），返回 `ambiguous`，网页给出醒目提示，不武断放行。
-6. **无效音频不覆盖结果**：格式/时长/参考质量不合格时返回 400 且不写入状态，上一次有效结果原样保留。
+5. **重击遮蔽补回**：一段录音里出现一声重击时，自适应门限会被抬高，原本能识别的轻冲可能低于门限而被漏检、误报为漏冲。为修正：
+   - 仅在原匹配归属唯一（`ambiguous == false`）时启用；
+   - 只在**相邻两次已匹配的冲次之间**补查未进入检测序列、但明显高于附近背景的弱峰（首匹配前 / 末匹配后没有整段节奏约束，不补）；
+   - 补回后，从左侧匹配到右侧匹配的**整段**冲次仍须逐对符合 ±15% 节奏；
+   - 每段采用「补回冲次最多」的方案；若最大方案存在**归属不同**的并列，该段保留原判定并在结果中标记 `review_segments`、提示人工复听；
+   - 补查沿用 40 ms 去回声规则（已确认冲次及其回声不会再作为弱峰被补回）；
+   - 未采用的弱峰不进入待检冲次序列，**不计多冲**；已确认的多冲仍按实录时刻标出。
+6. **歧义人工复听**：若多种归属具有相同的最优成本（同样满足节奏与最少漏/多冲），返回 `ambiguous`，网页给出醒目提示，不武断放行。
+7. **无效音频不覆盖结果**：格式/时长/参考质量不合格时返回 400 且不写入状态，上一次有效结果原样保留。
 
 ## 启动（Docker Compose）
 
@@ -44,7 +51,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/api/health` | 健康检查 |
 | `GET` | `/data/uploads/{name}` | 回传已上传录音，供网页播放器定位播放 |
 
-结果关键字段：`verdict`（`ok` / `defect` / `ambiguous`）、`missed[].ref_index`（漏冲对应的参考冲次，从 0 开始）、`missed[].expected_time`（待检中预计应出现的时刻）、`extras[].time`（多充实录时刻）、`matches`（匹配明细）、`warnings`（回声抑制、歧义等提示）。
+结果关键字段：`verdict`（`ok` / `defect` / `ambiguous`）、`missed[].ref_index`（漏冲对应的参考冲次，从 0 开始）、`missed[].expected_time`（待检中预计应出现的时刻）、`extras[].time`（多充实录时刻）、`matches`（匹配明细，`recovered` 标记补回冲次）、`recovered`（补回的弱峰：`ref_index` + 实录 `time`）、`review_segments`（补回归属并列、需人工复听的时段，`start`/`end`）、`review_required`（布尔，等价于 `review_segments` 非空）、`warnings`（回声抑制、补回、歧义、复听等提示）。`summary` 中 `test_impact_count` 为补回后的待检冲次数，`detected_impact_count` 为常规检测到的数量，`recovered_count` 为补回数量。
 
 ## 测试
 
@@ -58,15 +65,17 @@ python3 -m pytest tests/ -q
 python3 scripts/gen_demo.py /tmp/demo
 ```
 
+生成 `ref.wav` 与 `test_ok / test_miss / test_extra / test_ambiguous / test_masked / test_review`，其中 `test_masked` 为重击遮蔽轻冲、`test_review` 为弱峰补回归属并列（应提示复听）。
+
 ## 目录结构
 
 ```
 app/
-  audio.py       WAV 校验与冲击检测
-  matching.py    节奏匹配动态规划（漏冲/多冲/歧义）
+  audio.py       WAV 校验、冲击检测、重击遮蔽弱峰补查
+  matching.py    节奏匹配动态规划（漏冲/多冲/歧义）与分段弱峰补回
   service.py     检查服务与结果存储（无效输入不覆盖旧结果）
   main.py        FastAPI 路由
   static/        单页前端（上传、波形标注、点击定位播放）
-tests/           检测、匹配、端到端 API 测试（28 项）
+tests/           检测、匹配、端到端 API 测试（41 项）
 scripts/         演示 WAV 生成
 ```

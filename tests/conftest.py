@@ -26,10 +26,14 @@ def build_wav(
     sample_width: int = 2,
     channels: int = 1,
     seed: int = 7,
+    gains: dict[float, float] | None = None,
+    extra_echoes: list[tuple[float, float, float]] | None = None,
 ) -> bytes:
     """生成带若干冲击噪声脉冲的 PCM WAV。
 
     echoes: {主冲击时刻: 回声延迟秒}，回声幅度约为主冲击的 40%。
+    gains: {主冲击时刻: 覆盖 gain 的幅度}，用于制造重击遮蔽的轻冲。
+    extra_echoes: [(主冲击时刻, 延迟秒, 绝对幅度)]，可在任意冲次上加回声。
     """
     rng = np.random.default_rng(seed)
     if duration is None:
@@ -47,10 +51,13 @@ def build_wav(
         seg = rng.standard_normal(end - start).astype(np.float32)
         x[start:end] += amp * seg * decay[: end - start]
 
+    overrides = gains or {}
     for t in impact_times:
-        put(t, gain)
+        put(t, overrides.get(t, gain))
     for t, delay in (echoes or {}).items():
         put(t + delay, gain * echo_gain)
+    for t, delay, amp in extra_echoes or []:
+        put(t + delay, amp)
 
     x = np.clip(x, -1.0, 1.0)
 

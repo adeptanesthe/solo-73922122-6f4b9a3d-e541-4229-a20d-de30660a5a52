@@ -13,6 +13,7 @@ from typing import Any
 
 from .audio import (
     detect_impacts,
+    find_weak_peaks,
     parse_wav,
     validate_reference,
 )
@@ -46,10 +47,21 @@ class Store:
         validate_reference(ref_det)  # 参考不达标 -> AudioValidationError
         test_det = detect_impacts(test_samples)
 
-        alignment = align_impacts(ref_det.times, test_det.times)
+        # 重击遮蔽补查：检测序列之外的弱峰只在匹配段之间补回，
+        # 排除已确认冲次与被抑制的回声（40ms 去回声规则）
+        weak_times = find_weak_peaks(
+            test_samples,
+            0.0,
+            test_det.duration,
+            exclude_times=list(test_det.times) + list(test_det.suppressed_echoes),
+        )
+        alignment = align_impacts(ref_det.times, test_det.times, weak_times)
+        # 补回后待检冲次序列（含补回弱峰）；未采用的弱峰不在其中
+        test_times = alignment.test_times or test_det.times
 
         matched_ref = {i for i, _ in alignment.matched}
         matched_test = {j for _, j in alignment.matched}
+        recovered_times = {t for _, t in alignment.recovered}
         ref_url = self._save_wav(reference_raw, "ref")
         test_url = self._save_wav(test_raw, "test")
 
@@ -67,8 +79,9 @@ class Store:
                 "time": round(t, 4),
                 "matched": j in matched_test,
                 "is_extra": j in alignment.extra_test_indices,
+                "is_recovered": t in recovered_times,
             }
-            for j, t in enumerate(test_det.times)
+            for j, t in enumerate(test_times)
         ]
 
         missed = [
@@ -84,7 +97,7 @@ class Store:
         extras = [
             {
                 "test_index": j,
-                "time": round(test_det.times[j], 4),
+                "time": round(test_times[j], 4),
             }
             for j in alignment.extra_test_indices
         ]
@@ -93,7 +106,8 @@ class Store:
                 "ref_index": i,
                 "test_index": j,
                 "ref_time": round(ref_det.times[i], 4),
-                "test_time": round(test_det.times[j], 4),
+                "test_time": round(test_times[j], 4),
+                "recovered": test_times[j] in recovered_times,
             }
             for i, j in alignment.matched
         ]
@@ -113,6 +127,17 @@ class Store:
             )
         if alignment.ambiguous:
             warnings.append("存在多种同样符合节奏与最少漏/多冲规则的归属，请人工复听")
+        if alignment.recovered:
+            warnings.append(
+                f"补回 {len(alignment.recovered)} 个被重击遮蔽的弱冲"
+                f"（参考冲次：{'、'.join(str(i + 1) for i, _ in alignment.recovered)}），"
+                "已按 40ms 去回声规则核对并纳入节奏匹配"
+            )
+        for lo, hi in alignment.review_segments:
+            warnings.append(
+                f"待检录音 {lo:.3f}s–{hi:.3f}s 段内弱峰补回归属并列，"
+                "该段保留原判定，请人工复听"
+            )
 
         result = {
             "id": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"),
@@ -120,13 +145,17 @@ class Store:
             "verdict": verdict,
             "ambiguous": alignment.ambiguous,
             "optimal_way_count": alignment.optimal_way_count,
+            "review_required": alignment.review_required,
             "summary": {
                 "reference_impact_count": len(ref_det.times),
-                "test_impact_count": len(test_det.times),
+                "test_impact_count": len(test_times),
+                "detected_impact_count": len(test_det.times),
                 "matched_count": len(alignment.matched),
                 "miss_count": alignment.miss_count,
                 "extra_count": alignment.extra_count,
                 "suppressed_echo_count": len(test_det.suppressed_echoes),
+                "recovered_count": len(alignment.recovered),
+                "weak_peak_count": len(weak_times),
             },
             "reference": {
                 "url": ref_url,
@@ -141,6 +170,14 @@ class Store:
             "matches": matches,
             "missed": missed,
             "extras": extras,
+            "recovered": [
+                {"ref_index": i, "time": round(t, 4)}
+                for i, t in alignment.recovered
+            ],
+            "review_segments": [
+                {"start": round(lo, 4), "end": round(hi, 4)}
+                for lo, hi in alignment.review_segments
+            ],
             "timing_ratios": [round(r, 4) for r in alignment.timing_ratios],
             "warnings": warnings,
         }

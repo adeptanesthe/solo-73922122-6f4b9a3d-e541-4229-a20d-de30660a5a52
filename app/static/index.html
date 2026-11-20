@@ -54,6 +54,14 @@
     margin-top: 14px; padding: 12px 14px; border-radius: 8px;
     background: rgba(243,156,18,.12); border: 1px solid var(--warn); color: #ffce85;
   }
+  .review-banner {
+    margin-top: 14px; padding: 12px 14px; border-radius: 8px;
+    background: rgba(243,156,18,.08); border: 1px dashed var(--warn); color: #ffce85;
+  }
+  .recovered-banner {
+    margin-top: 14px; padding: 12px 14px; border-radius: 8px;
+    background: rgba(74,168,255,.08); border: 1px solid var(--info); color: #a9d4ff;
+  }
   .warnings { margin: 10px 0 0; padding-left: 18px; color: var(--muted); }
   .warnings li { margin: 2px 0; }
   h3 { margin: 0 0 10px; font-size: 15px; }
@@ -71,7 +79,8 @@
   .lg-match::before { background: var(--ok); }
   .lg-miss::before { background: var(--bad); }
   .lg-extra::before { background: var(--warn); }
-  .lg-cursor::before { background: var(--info); }
+  .lg-recovered::before { background: var(--info); }
+  .lg-cursor::before { background: #b9c7d8; }
   table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
   th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
   th { color: var(--muted); font-weight: 600; }
@@ -117,6 +126,8 @@
     <div id="ambiguousBanner" class="ambiguous-banner" style="display:none">
       ⚠ 存在多种同样符合节奏与最少漏冲/多冲规则的冲次归属，系统不做武断放行，<b>请值班员人工复听确认</b>。
     </div>
+    <div id="reviewBanner" class="review-banner" style="display:none"></div>
+    <div id="recoveredBanner" class="recovered-banner" style="display:none"></div>
     <ul class="warnings" id="warnings"></ul>
   </section>
 
@@ -130,7 +141,7 @@
         </div>
       </div>
       <div>
-        <h3>待检录音波形（绿=已匹配，橙=多冲）</h3>
+        <h3>待检录音波形（绿=已匹配，蓝=补回的弱冲，橙=多冲）</h3>
         <div class="track-wrap">
           <canvas id="testCanvas"></canvas>
           <audio id="testAudio" controls preload="metadata"></audio>
@@ -139,6 +150,7 @@
     </div>
     <div class="legend">
       <span class="lg-match">匹配冲次</span>
+      <span class="lg-recovered">补回的弱冲（重击遮蔽）</span>
       <span class="lg-miss">漏冲（参考冲次）</span>
       <span class="lg-extra">多冲（实录时刻）</span>
       <span class="lg-cursor">播放位置（点击波形定位）</span>
@@ -162,7 +174,7 @@
         </table>
       </div>
     </div>
-    <p class="empty" style="margin-top:14px">说明：每次漏冲只标注对应参考冲次，后续冲次按参考序号继续对齐，不会整体错位；40ms 内回声已在检测阶段剔除，不计多冲。</p>
+    <p class="empty" style="margin-top:14px">说明：每次漏冲只标注对应参考冲次，后续冲次按参考序号继续对齐，不会整体错位；重击遮蔽的弱冲在相邻两次已匹配冲次之间补回（按 40ms 去回声规则），补回后整段仍须满足 ±15% 节奏，未采用的弱峰不计多冲；40ms 内回声已在检测阶段剔除，不计多冲。</p>
   </section>
 </main>
 
@@ -235,10 +247,32 @@ function render(r) {
     ["匹配", s.matched_count],
     ["漏冲", s.miss_count],
     ["多冲", s.extra_count],
+    ["补回弱冲", s.recovered_count ?? 0],
     ["回声抑制", s.suppressed_echo_count],
   ].map(([k, v]) => `<span>${k}：<b>${v}</b></span>`).join("");
 
   $("ambiguousBanner").style.display = r.ambiguous ? "block" : "none";
+
+  const reviewBanner = $("reviewBanner");
+  if ((r.review_segments || []).length) {
+    reviewBanner.innerHTML = "⚠ 弱峰补回归属并列：" + r.review_segments
+      .map((seg) => `${seg.start.toFixed(3)}s–${seg.end.toFixed(3)}s`)
+      .join("、") + " 段保留原判定，<b>请人工复听该段</b>。";
+    reviewBanner.style.display = "block";
+  } else {
+    reviewBanner.style.display = "none";
+  }
+
+  const recoveredBanner = $("recoveredBanner");
+  if (s.recovered_count > 0) {
+    recoveredBanner.textContent = `已补回 ${s.recovered_count} 个被重击遮蔽的弱冲（记录于 ${
+      (r.recovered || []).map((x) => x.time.toFixed(3) + "s").join("、")
+    }），补回后整段已按 ±15% 节奏复核。`;
+    recoveredBanner.style.display = "block";
+  } else {
+    recoveredBanner.style.display = "none";
+  }
+
   $("warnings").innerHTML = (r.warnings || []).map((w) => `<li>${w}</li>`).join("");
 
   $("refAudio").src = r.reference.url + "?t=" + r.id;
@@ -246,10 +280,12 @@ function render(r) {
 
   loadPeaks(r.reference.url, r.reference.duration, "refCanvas", "refAudio",
     r.reference.impacts,
-    r.missed.map((m) => ({ time: m.ref_time, kind: "miss" })));
+    r.missed.map((m) => ({ time: m.ref_time, kind: "miss" })),
+    []);
   loadPeaks(r.test.url, r.test.duration, "testCanvas", "testAudio",
     r.test.impacts,
-    r.extras.map((e) => ({ time: e.time, kind: "extra" })));
+    r.extras.map((e) => ({ time: e.time, kind: "extra" })),
+    (r.review_segments || []).map((seg) => ({ start: seg.start, end: seg.end })));
 
   const missBody = $("missTable").querySelector("tbody");
   missBody.innerHTML = r.missed.length ? r.missed.map((m) => `
@@ -298,7 +334,7 @@ async function decodeWav(url) {
   throw new Error("WAV 中未找到 data 块");
 }
 
-function drawWave(canvas, samples, duration, impacts, extraMarkers, cursorTime) {
+function drawWave(canvas, samples, duration, impacts, extraMarkers, cursorTime, reviewSegs) {
   const dpr = window.devicePixelRatio || 1;
   const cssW = canvas.clientWidth || canvas.parentElement.clientWidth;
   canvas.width = cssW * dpr;
@@ -331,6 +367,17 @@ function drawWave(canvas, samples, duration, impacts, extraMarkers, cursorTime) 
 
   const xOf = (t) => (duration > 0 ? (t / duration) * W : 0);
 
+  // 补回归属并列的段：淡黄底 + 虚线边框，提示人工复听
+  for (const seg of reviewSegs || []) {
+    const x1 = xOf(seg.start), x2 = xOf(seg.end);
+    ctx.fillStyle = "rgba(243,156,18,.10)";
+    ctx.fillRect(x1, 0, Math.max(2, x2 - x1), H);
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = "#f39c12"; ctx.lineWidth = 1;
+    ctx.strokeRect(x1 + 0.5, 0.5, Math.max(2, x2 - x1) - 1, H - 1);
+    ctx.setLineDash([]);
+  }
+
   // 漏冲（参考侧）/多冲（待检侧）标记：贯穿竖线
   for (const m of extraMarkers || []) {
     const color = m.kind === "miss" ? "#e74c3c" : "#f39c12";
@@ -338,21 +385,26 @@ function drawWave(canvas, samples, duration, impacts, extraMarkers, cursorTime) 
     ctx.strokeStyle = color; ctx.lineWidth = 2;
     ctx.beginPath(); ctx.moveTo(x, 4); ctx.lineTo(x, H - 4); ctx.stroke();
   }
-  // 每个检测到的冲次：匹配绿、多冲橙、未匹配（参考漏冲）红
+  // 每个检测到的冲次：匹配绿、补回蓝、多冲橙、未匹配（参考漏冲）红
   for (const imp of impacts || []) {
     const x = xOf(imp.time);
     let color = "#2ecc71";
     if (imp.is_extra) color = "#f39c12";
+    else if (imp.is_recovered) color = "#4aa8ff";
     else if (imp.matched === false) color = "#e74c3c";
     ctx.strokeStyle = color; ctx.lineWidth = 1.5;
     ctx.beginPath(); ctx.moveTo(x, 10); ctx.lineTo(x, H - 10); ctx.stroke();
     ctx.fillStyle = color;
     ctx.beginPath(); ctx.arc(x, 10, 3, 0, Math.PI * 2); ctx.fill();
+    if (imp.is_recovered) {  // 补回弱冲加空心圈，区别普通匹配
+      ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(x, 10, 6, 0, Math.PI * 2); ctx.stroke();
+    }
   }
 
   if (cursorTime != null && cursorTime >= 0) {
     const x = xOf(cursorTime);
-    ctx.strokeStyle = "#4aa8ff"; ctx.lineWidth = 2;
+    ctx.strokeStyle = "#b9c7d8"; ctx.lineWidth = 2;
     ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
   }
 }
@@ -365,12 +417,12 @@ function bindCanvas(canvas, audio, duration) {
   };
 }
 
-async function loadPeaks(url, duration, canvasId, audioId, impacts, extraMarkers) {
+async function loadPeaks(url, duration, canvasId, audioId, impacts, extraMarkers, reviewSegs) {
   const canvas = $(canvasId);
   const audio = $(audioId);
   const samples = await decodeWav(url);
   const redraw = (cursorTime) =>
-    drawWave(canvas, samples, duration, impacts, extraMarkers, cursorTime);
+    drawWave(canvas, samples, duration, impacts, extraMarkers, cursorTime, reviewSegs);
   redraw(0);
   bindCanvas(canvas, audio, duration);
   let raf = null;
